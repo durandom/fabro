@@ -9,7 +9,27 @@ use super::Transform;
 ///
 /// Identifiers match `[a-zA-Z_][a-zA-Z0-9_]*`. A `$` not followed by an
 /// identifier character is left as-is. Undefined variables produce an error.
+///
+/// Use [`expand_vars_lenient`] when unknown `$name` references should be
+/// kept as-is (e.g. in setup commands where shell variables like `$HOME`
+/// must pass through to the shell).
 pub fn expand_vars(source: &str, vars: &HashMap<String, String>) -> anyhow::Result<String> {
+    expand_vars_inner(source, vars, true)
+}
+
+/// Like [`expand_vars`], but leaves undefined variables intact instead of
+/// erroring. This is appropriate for strings that will be evaluated by a
+/// shell, where `$HOME`, `$PATH`, etc. should pass through.
+pub fn expand_vars_lenient(source: &str, vars: &HashMap<String, String>) -> String {
+    // Lenient mode never errors, so unwrap is safe.
+    expand_vars_inner(source, vars, false).unwrap()
+}
+
+fn expand_vars_inner(
+    source: &str,
+    vars: &HashMap<String, String>,
+    strict: bool,
+) -> anyhow::Result<String> {
     let mut result = String::with_capacity(source.len());
     let bytes = source.as_bytes();
     let len = bytes.len();
@@ -29,7 +49,12 @@ pub fn expand_vars(source: &str, vars: &HashMap<String, String>) -> anyhow::Resu
                 let name = &source[start..end];
                 match vars.get(name) {
                     Some(value) => result.push_str(value),
-                    None => bail!("Undefined variable: ${name}"),
+                    None if strict => bail!("Undefined variable: ${name}"),
+                    None => {
+                        // Keep the original $name for the shell to resolve.
+                        result.push('$');
+                        result.push_str(name);
+                    }
                 }
                 i = end;
             } else {
@@ -110,6 +135,33 @@ mod tests {
         assert_eq!(
             expand_vars("literal $$name here", &vars).unwrap(),
             "literal $name here"
+        );
+    }
+
+    #[test]
+    fn lenient_expands_known_vars() {
+        let vars = HashMap::from([("agent".to_string(), "atlas".to_string())]);
+        assert_eq!(
+            expand_vars_lenient("setup --agent $agent", &vars),
+            "setup --agent atlas"
+        );
+    }
+
+    #[test]
+    fn lenient_preserves_unknown_vars() {
+        let vars = HashMap::from([("agent".to_string(), "atlas".to_string())]);
+        assert_eq!(
+            expand_vars_lenient("$HOME/bin --agent $agent", &vars),
+            "$HOME/bin --agent atlas"
+        );
+    }
+
+    #[test]
+    fn lenient_preserves_shell_vars_with_no_fabro_vars() {
+        let vars = HashMap::new();
+        assert_eq!(
+            expand_vars_lenient("echo $HOME $PATH", &vars),
+            "echo $HOME $PATH"
         );
     }
 

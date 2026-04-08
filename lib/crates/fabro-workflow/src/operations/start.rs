@@ -14,6 +14,7 @@ use fabro_types::{RunId, Settings};
 use crate::artifact_upload::StageArtifactUploader;
 use crate::context::Context;
 use crate::error::FabroError;
+use crate::transforms::expand_vars_lenient;
 use crate::event::{
     Emitter, Event, EventBody, RunEventLogger, RunEventSink, RunNoticeLevel, append_event_to_sink,
 };
@@ -391,7 +392,14 @@ impl RunSession {
             interviewer,
             on_node: services.on_node,
             lifecycle: LifecycleOptions {
-                setup_commands: settings.setup_commands().to_vec(),
+                setup_commands: match settings.vars.as_ref() {
+                    Some(vars) => settings
+                        .setup_commands()
+                        .iter()
+                        .map(|cmd| expand_vars_lenient(cmd, vars))
+                        .collect(),
+                    None => settings.setup_commands().to_vec(),
+                },
                 setup_command_timeout_ms: settings.setup_timeout_ms().unwrap_or(300_000),
                 devcontainer_phases: Vec::new(),
             },

@@ -19,4 +19,4 @@ pub use import::ImportTransform;
 pub use model_resolution::ModelResolutionTransform;
 pub use preamble::PreambleTransform;
 pub use stylesheet_application::StylesheetApplicationTransform;
-pub use variable_expansion::{VariableExpansionTransform, expand_vars};
+pub use variable_expansion::{VariableExpansionTransform, expand_vars, expand_vars_lenient};
