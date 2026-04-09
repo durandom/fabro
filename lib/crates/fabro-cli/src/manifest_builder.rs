@@ -98,15 +98,16 @@ pub(crate) fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManif
         });
     }
 
+    let working_directory = project::resolve_working_directory(&merged_settings, &input.cwd);
+
     let goal = resolve_manifest_goal(
         &input.args_layer,
         &merged_settings,
         &root_source,
         &target_path,
-        &input.cwd,
+        &working_directory,
     )?;
 
-    let working_directory = project::resolve_working_directory(&merged_settings, &input.cwd);
     let git = build_manifest_git(&working_directory);
     let args = input.args.filter(|args| !manifest_args_is_empty(args));
 
@@ -387,9 +388,8 @@ fn resolve_manifest_goal(
     settings: &Settings,
     root_source: &str,
     root_dot_path: &Path,
-    cwd: &Path,
+    working_directory: &Path,
 ) -> Result<Option<types::ManifestGoal>> {
-    let working_directory = project::resolve_working_directory(settings, cwd);
 
     if let Some(goal) = args_layer.goal.as_ref() {
         return Ok(Some(types::ManifestGoal {
@@ -456,11 +456,11 @@ fn resolve_goal_file_path(goal_file: &Path, working_directory: &Path) -> PathBuf
     }
 }
 
-fn build_manifest_git(cwd: &Path) -> Option<types::ManifestGit> {
-    let (origin_url, branch) = detect_repo_info(cwd).ok()?;
+fn build_manifest_git(repo_path: &Path) -> Option<types::ManifestGit> {
+    let (origin_url, branch) = detect_repo_info(repo_path).ok()?;
     let branch = branch?;
-    let sha = head_sha(cwd).ok()?;
-    let clean = sync_status(cwd, "origin", Some(&branch)) != GitSyncStatus::Dirty;
+    let sha = head_sha(repo_path).ok()?;
+    let clean = sync_status(repo_path, "origin", Some(&branch)) != GitSyncStatus::Dirty;
     Some(types::ManifestGit {
         branch,
         clean,
