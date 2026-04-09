@@ -106,7 +106,8 @@ pub(crate) fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManif
         &input.cwd,
     )?;
 
-    let git = build_manifest_git(&input.cwd);
+    let working_directory = project::resolve_working_directory(&merged_settings, &input.cwd);
+    let git = build_manifest_git(&working_directory);
     let args = input.args.filter(|args| !manifest_args_is_empty(args));
 
     Ok(BuiltManifest {
