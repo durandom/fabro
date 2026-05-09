@@ -301,6 +301,11 @@ pub struct CliResponse {
     pub text:          String,
     pub input_tokens:  i64,
     pub output_tokens: i64,
+    /// Codex emits `{"type":"thread.started","thread_id":"<uuid>"}` on every
+    /// run. Captured here so the handler can cache it per workflow `thread_id`
+    /// and pass it back via `codex exec resume <uuid>` on the next call. None
+    /// for Claude/Gemini and for Codex output that lacks the event.
+    pub captured_session_id: Option<uuid::Uuid>,
 }
 
 /// Parse NDJSON output from Claude CLI (`--output-format stream-json`).
@@ -341,6 +346,7 @@ fn parse_claude_ndjson(output: &str) -> Option<CliResponse> {
         text,
         input_tokens,
         output_tokens,
+        captured_session_id: None,
     })
 }
 
@@ -354,6 +360,7 @@ fn parse_codex_ndjson(output: &str) -> Option<CliResponse> {
     let mut input_tokens: i64 = 0;
     let mut output_tokens: i64 = 0;
     let mut found_anything = false;
+    let mut captured_session_id: Option<uuid::Uuid> = None;
 
     for line in output.lines() {
         let line = line.trim();
@@ -368,6 +375,14 @@ fn parse_codex_ndjson(output: &str) -> Option<CliResponse> {
         let event_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match event_type {
+            "thread.started" => {
+                if let Some(id) = value.get("thread_id").and_then(|v| v.as_str()) {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(id) {
+                        captured_session_id = Some(uuid);
+                        found_anything = true;
+                    }
+                }
+            }
             "item.completed" => {
                 let item_type = value
                     .pointer("/item/type")
@@ -403,6 +418,7 @@ fn parse_codex_ndjson(output: &str) -> Option<CliResponse> {
         text: last_message_text,
         input_tokens,
         output_tokens,
+        captured_session_id,
     })
 }
 
@@ -439,6 +455,7 @@ fn parse_gemini_json(output: &str) -> Option<CliResponse> {
         text,
         input_tokens,
         output_tokens,
+        captured_session_id: None,
     })
 }
 
@@ -1426,13 +1443,21 @@ mod tests {
     fn cli_command_for_claude_omits_model_when_not_a_claude_model() {
         // settings.run.model defaulted to e.g. gpt-5.3-codex; we must not pass
         // it to claude, which would silently exit with empty output.
-        let cmd =
-            cli_command_for_provider(Provider::Anthropic, "gpt-5.3-codex", "/tmp/prompt.txt");
+        let cmd = cli_command_for_provider(
+            Provider::Anthropic,
+            "gpt-5.3-codex",
+            "/tmp/prompt.txt",
+            None,
+        );
         assert!(cmd.contains("claude -p"));
         assert!(!cmd.contains("--model "));
         // Sanity: a real claude model is still pinned through.
-        let cmd =
-            cli_command_for_provider(Provider::Anthropic, "claude-sonnet-4-5", "/tmp/prompt.txt");
+        let cmd = cli_command_for_provider(
+            Provider::Anthropic,
+            "claude-sonnet-4-5",
+            "/tmp/prompt.txt",
+            None,
+        );
         assert!(cmd.contains("--model claude-sonnet-4-5"));
     }
 
@@ -1559,6 +1584,38 @@ mod tests {
     #[test]
     fn parse_codex_ndjson_returns_none_for_no_events() {
         assert!(parse_cli_response(Provider::OpenAi, "not json at all").is_none());
+    }
+
+    #[test]
+    fn parse_codex_ndjson_captures_thread_started_uuid() {
+        let output = r#"{"type":"thread.started","thread_id":"019e0d50-1505-7da3-bcd9-43780c698fc9"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"hi"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let response = parse_cli_response(Provider::OpenAi, output).unwrap();
+        assert_eq!(
+            response.captured_session_id,
+            Some(uuid::uuid!("019e0d50-1505-7da3-bcd9-43780c698fc9")),
+        );
+    }
+
+    #[test]
+    fn parse_codex_ndjson_captured_id_none_when_thread_id_not_uuid() {
+        // The pre-existing test uses "abc" as thread_id; verify that the new
+        // capture path tolerates non-UUID values (older codex versions, edge
+        // cases) by leaving captured_session_id at None instead of erroring.
+        let output = r#"{"type":"thread.started","thread_id":"abc"}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let response = parse_cli_response(Provider::OpenAi, output).unwrap();
+        assert!(response.captured_session_id.is_none());
+    }
+
+    #[test]
+    fn parse_claude_ndjson_captured_id_is_none() {
+        let output =
+            r#"{"type":"result","result":"hi","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let response = parse_cli_response(Provider::Anthropic, output).unwrap();
+        assert!(response.captured_session_id.is_none());
     }
 
     // -- Cycle 5: Node::backend() accessor (tested here since the accessor is
