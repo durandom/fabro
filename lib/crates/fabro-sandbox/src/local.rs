@@ -55,6 +55,10 @@ impl LocalSandbox {
         EnvVars::GOPATH,
         EnvVars::CARGO_HOME,
         EnvVars::NVM_DIR,
+        // Claude Code's long-lived OAuth token. Ends in `_token` so it would
+        // otherwise be stripped by should_filter_env_var. Safelisted so that
+        // env-source pickup and explicit launch-env injection both reach `claude`.
+        EnvVars::CLAUDE_CODE_OAUTH_TOKEN,
     ];
 
     fn should_filter_env_var(key: &str) -> bool {
@@ -969,6 +973,10 @@ mod tests {
         assert!(!LocalSandbox::should_filter_env_var("HOME"));
         assert!(!LocalSandbox::should_filter_env_var("EDITOR"));
         assert!(!LocalSandbox::should_filter_env_var("SECRET_PATH"));
+        // Claude Code OAuth token is safelisted despite ending in `_token`.
+        assert!(!LocalSandbox::should_filter_env_var("CLAUDE_CODE_OAUTH_TOKEN"));
+        // Negative case: an unrelated `_token` is still filtered.
+        assert!(LocalSandbox::should_filter_env_var("RANDOM_TOKEN"));
     }
 
     #[test]

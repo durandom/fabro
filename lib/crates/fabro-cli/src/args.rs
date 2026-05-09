@@ -728,6 +728,20 @@ pub(crate) struct ProviderLoginArgs {
     /// Read an API key from stdin instead of prompting
     #[arg(long)]
     pub(crate) api_key_stdin: bool,
+
+    /// Authentication method to use. Defaults to interactive selection.
+    #[arg(long, value_enum)]
+    pub(crate) method: Option<ProviderLoginMethod>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ProviderLoginMethod {
+    /// Provider API key (default).
+    #[value(name = "api-key")]
+    ApiKey,
+    /// Anthropic-only: Claude Code long-lived OAuth token from `claude setup-token`.
+    #[value(name = "claude-oauth")]
+    ClaudeOauth,
 }
 
 #[derive(Args)]

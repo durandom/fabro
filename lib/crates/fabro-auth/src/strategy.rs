@@ -4,6 +4,7 @@ use fabro_model::Provider;
 use crate::context::{AuthContextRequest, AuthContextResponse};
 use crate::credential::{AuthCredential, OAuthConfig};
 use crate::strategies::api_key::ApiKeyStrategy;
+use crate::strategies::claude_code_oauth::ClaudeCodeOAuthStrategy;
 use crate::strategies::codex_device::CodexDeviceStrategy;
 
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -20,6 +21,7 @@ pub trait AuthStrategy: Send {
 pub enum AuthMethod {
     ApiKey,
     CodexDevice(OAuthConfig),
+    ClaudeCodeOAuth,
 }
 
 #[must_use]
@@ -50,6 +52,14 @@ pub fn strategy_for(provider: Provider, method: AuthMethod) -> Box<dyn AuthStrat
                 "Codex device auth is only supported for OpenAI"
             );
             Box::new(CodexDeviceStrategy::new(config))
+        }
+        AuthMethod::ClaudeCodeOAuth => {
+            assert_eq!(
+                provider,
+                Provider::Anthropic,
+                "Claude Code OAuth is only supported for Anthropic"
+            );
+            Box::new(ClaudeCodeOAuthStrategy::new())
         }
     }
 }

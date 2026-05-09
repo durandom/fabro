@@ -139,6 +139,14 @@ impl CredentialResolver {
             self.find_credential(&vault, provider, usage)?
         };
 
+        if matches!(usage, CredentialUsage::ApiRequest)
+            && matches!(initial_credential.details, AuthDetails::ClaudeCodeOAuth { .. })
+        {
+            // Claude Code OAuth tokens are not accepted by direct API calls;
+            // only the CLI agent path consumes them.
+            return Err(ResolveError::NotConfigured(provider));
+        }
+
         let credential = if initial_credential.needs_refresh() {
             let AuthDetails::CodexOAuth { tokens, .. } = &initial_credential.details else {
                 unreachable!("only OAuth credentials can need refresh");
@@ -215,6 +223,20 @@ impl CredentialResolver {
             }
         }
 
+        // Anthropic + CLI usage: fall back to a Claude Code OAuth token from the
+        // env if no API key is configured. OAuth tokens are not valid for direct
+        // API requests, so we only offer them to CLI consumers.
+        if matches!(provider, Provider::Anthropic)
+            && matches!(usage, CredentialUsage::CliAgent(CliAgentKind::Claude))
+        {
+            if let Some(token) = self.lookup_env_or_vault(vault, EnvVars::CLAUDE_CODE_OAUTH_TOKEN) {
+                return Ok(AuthCredential {
+                    provider,
+                    details: AuthDetails::ClaudeCodeOAuth { token },
+                });
+            }
+        }
+
         Err(ResolveError::NotConfigured(provider))
     }
 
@@ -226,6 +248,11 @@ impl CredentialResolver {
                 .api_key_env_vars()
                 .iter()
                 .any(|env_var| self.lookup_env_or_vault(vault, env_var).is_some())
+            || (matches!(provider, Provider::Anthropic)
+                && (vault_get_credential(vault, "anthropic_claude_oauth").is_some()
+                    || self
+                        .lookup_env_or_vault(vault, EnvVars::CLAUDE_CODE_OAUTH_TOKEN)
+                        .is_some()))
     }
 
     fn lookup_env_or_vault(&self, vault: &Vault, name: &str) -> Option<String> {
@@ -251,6 +278,11 @@ impl CredentialResolver {
                     cred.project_id = self.lookup_env_or_vault(vault, EnvVars::OPENAI_PROJECT_ID);
                 }
                 cred
+            }
+            AuthDetails::ClaudeCodeOAuth { .. } => {
+                // Guarded against in `resolve()`; OAuth tokens aren't valid API
+                // credentials.
+                unreachable!("ClaudeCodeOAuth is rejected for ApiRequest usage")
             }
             AuthDetails::CodexOAuth {
                 tokens, account_id, ..
@@ -295,6 +327,18 @@ impl CredentialResolver {
                     env_vars.insert(EnvVars::CHATGPT_ACCOUNT_ID.to_string(), account_id.clone());
                 }
                 Some(codex_login_command(&tokens.access_token))
+            }
+            (
+                Provider::Anthropic,
+                AuthDetails::ClaudeCodeOAuth { token },
+                CliAgentKind::Claude,
+            ) => {
+                env_vars.insert(EnvVars::CLAUDE_CODE_OAUTH_TOKEN.to_string(), token.clone());
+                None
+            }
+            (_, AuthDetails::ClaudeCodeOAuth { .. }, _) => {
+                // OAuth token is only valid for the Anthropic Claude CLI agent.
+                None
             }
             (_, AuthDetails::ApiKey { key }, _) => {
                 if let Some(name) = credential.provider.api_key_env_vars().first() {
@@ -360,6 +404,9 @@ fn credential_ids_for(provider: Provider, usage: CredentialUsage) -> &'static [&
             &["openai_codex", "openai"]
         }
         (Provider::OpenAi, _) => &["openai", "openai_codex"],
+        (Provider::Anthropic, CredentialUsage::CliAgent(CliAgentKind::Claude)) => {
+            &["anthropic", "anthropic_claude_oauth"]
+        }
         (Provider::Anthropic, _) => &["anthropic"],
         (Provider::Gemini, _) => &["gemini"],
         (Provider::Kimi, _) => &["kimi"],
@@ -482,6 +529,124 @@ mod tests {
     async fn resolve_returns_not_configured_for_missing_provider() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        let resolver = test_resolver(vault, Arc::new(|_| None));
+
+        let err = resolver
+            .resolve(Provider::Anthropic, CredentialUsage::ApiRequest)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ResolveError::NotConfigured(Provider::Anthropic)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_credential_anthropic_oauth_emits_oauth_token_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        vault_set_credential(&mut vault, "anthropic_claude_oauth", &AuthCredential {
+            provider: Provider::Anthropic,
+            details:  AuthDetails::ClaudeCodeOAuth {
+                token: "sk-ant-oat-test".to_string(),
+            },
+        })
+        .unwrap();
+        let resolver = test_resolver(vault, Arc::new(|_| None));
+
+        let resolved = resolver
+            .resolve(
+                Provider::Anthropic,
+                CredentialUsage::CliAgent(CliAgentKind::Claude),
+            )
+            .await
+            .unwrap();
+
+        let ResolvedCredential::Cli(cli) = resolved else {
+            panic!("expected cli credential");
+        };
+        assert_eq!(
+            cli.env_vars.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("sk-ant-oat-test")
+        );
+        assert!(
+            !cli.env_vars.contains_key("ANTHROPIC_API_KEY"),
+            "must NOT also emit API key env var; would override OAuth token in claude"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_credential_anthropic_oauth_picked_up_from_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        let resolver = test_resolver(
+            vault,
+            Arc::new(|name| {
+                (name == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "sk-ant-oat-env".to_string())
+            }),
+        );
+
+        let ResolvedCredential::Cli(cli) = resolver
+            .resolve(
+                Provider::Anthropic,
+                CredentialUsage::CliAgent(CliAgentKind::Claude),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected cli credential");
+        };
+
+        assert_eq!(
+            cli.env_vars.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("sk-ant-oat-env")
+        );
+        assert!(!cli.env_vars.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_api_key_env_preferred_over_oauth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        let resolver = test_resolver(
+            vault,
+            Arc::new(|name| match name {
+                "ANTHROPIC_API_KEY" => Some("sk-ant-api".to_string()),
+                "CLAUDE_CODE_OAUTH_TOKEN" => Some("sk-ant-oat".to_string()),
+                _ => None,
+            }),
+        );
+
+        let ResolvedCredential::Cli(cli) = resolver
+            .resolve(
+                Provider::Anthropic,
+                CredentialUsage::CliAgent(CliAgentKind::Claude),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected cli credential");
+        };
+
+        assert_eq!(
+            cli.env_vars.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-ant-api")
+        );
+        assert!(!cli.env_vars.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn api_request_with_oauth_token_returns_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        vault_set_credential(&mut vault, "anthropic_claude_oauth", &AuthCredential {
+            provider: Provider::Anthropic,
+            details:  AuthDetails::ClaudeCodeOAuth {
+                token: "sk-ant-oat-test".to_string(),
+            },
+        })
+        .unwrap();
         let resolver = test_resolver(vault, Arc::new(|_| None));
 
         let err = resolver

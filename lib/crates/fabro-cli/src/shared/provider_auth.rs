@@ -18,6 +18,7 @@ use fabro_auth::{
     ApiCredential, AuthContextRequest, AuthContextResponse, AuthCredential, AuthMethod,
     codex_oauth_config, strategy_for,
 };
+use fabro_static::EnvVars;
 use fabro_llm::client::Client as LlmClient;
 use fabro_llm::generate::{GenerateParams, generate};
 use fabro_model::{Catalog, Provider};
@@ -146,8 +147,15 @@ async fn read_and_validate_api_key(
     s: &Styles,
     printer: Printer,
 ) -> Result<String> {
+    // Claude Code OAuth tokens cannot be validated against /v1/messages; only
+    // the `claude` CLI accepts them. Skip the live probe.
+    let skip_validation = env_var == EnvVars::CLAUDE_CODE_OAUTH_TOKEN;
     loop {
         let key = read_api_key_from_source(source, env_var).await?;
+        if skip_validation {
+            anyhow::ensure!(!key.trim().is_empty(), "OAuth token is empty");
+            return Ok(key);
+        }
 
         fabro_util::printerr!(printer, "  {}", s.dim.apply_to("Validating API key..."));
         match validate_api_key(provider, &key).await {
@@ -173,6 +181,20 @@ async fn read_and_validate_api_key(
 }
 
 pub(crate) async fn pick_auth_method(provider: Provider) -> Result<AuthMethod> {
+    if provider == Provider::Anthropic {
+        let use_oauth = spawn_blocking(|| {
+            prompt_confirm(
+                "Use a Claude Code OAuth token (subscription) instead of an API key?",
+                false,
+            )
+        })
+        .await??;
+        if use_oauth {
+            return Ok(AuthMethod::ClaudeCodeOAuth);
+        }
+        return Ok(AuthMethod::ApiKey);
+    }
+
     if provider != Provider::OpenAi {
         return Ok(AuthMethod::ApiKey);
     }
@@ -230,17 +252,31 @@ pub(crate) fn present_to_user(request: &AuthContextRequest, s: &Styles, printer:
             env_var_names,
         } => {
             let env_var = env_var_names.first().map_or("API_KEY", String::as_str);
-            let url = provider_key_url(*provider);
-            fabro_util::printerr!(
-                printer,
-                "  {}",
-                s.dim.apply_to(format!("Get your API key at: {url}"))
-            );
-            fabro_util::printerr!(
-                printer,
-                "  {}",
-                s.dim.apply_to(format!("Expected variable name: {env_var}"))
-            );
+            if env_var == EnvVars::CLAUDE_CODE_OAUTH_TOKEN {
+                fabro_util::printerr!(
+                    printer,
+                    "  {}",
+                    s.dim
+                        .apply_to("Run `claude setup-token` to generate a long-lived token.")
+                );
+                fabro_util::printerr!(
+                    printer,
+                    "  {}",
+                    s.dim.apply_to(format!("Expected variable name: {env_var}"))
+                );
+            } else {
+                let url = provider_key_url(*provider);
+                fabro_util::printerr!(
+                    printer,
+                    "  {}",
+                    s.dim.apply_to(format!("Get your API key at: {url}"))
+                );
+                fabro_util::printerr!(
+                    printer,
+                    "  {}",
+                    s.dim.apply_to(format!("Expected variable name: {env_var}"))
+                );
+            }
         }
         AuthContextRequest::DeviceCode {
             user_code,

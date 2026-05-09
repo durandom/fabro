@@ -4,7 +4,7 @@ pub async fn refresh_oauth_credential(
     credential: &AuthCredential,
 ) -> anyhow::Result<AuthCredential> {
     match &credential.details {
-        AuthDetails::ApiKey { .. } => Ok(credential.clone()),
+        AuthDetails::ApiKey { .. } | AuthDetails::ClaudeCodeOAuth { .. } => Ok(credential.clone()),
         AuthDetails::CodexOAuth {
             tokens,
             config,

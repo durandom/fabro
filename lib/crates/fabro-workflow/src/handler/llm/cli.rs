@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use fabro_agent::{Sandbox, StaticEnvProvider, ToolEnvProvider, shell_quote};
-use fabro_auth::{CliAgentKind, CredentialResolver, CredentialUsage, ResolvedCredential};
+use fabro_auth::{
+    CliAgentKind, CredentialResolver, CredentialUsage, ResolveError, ResolvedCredential,
+};
 use fabro_graphviz::graph::Node;
 use fabro_llm::types::TokenCounts;
 use fabro_model::Provider;
@@ -198,7 +200,6 @@ pub fn cli_command_for_provider(provider: Provider, model: &str, prompt_file: &s
     let model_flag = if model.is_empty() {
         String::new()
     } else {
-        let model = shell_quote(model);
         match provider {
             Provider::OpenAi
             | Provider::Gemini
@@ -207,9 +208,22 @@ pub fn cli_command_for_provider(provider: Provider, model: &str, prompt_file: &s
             | Provider::Minimax
             | Provider::Inception
             | Provider::OpenAiCompatible => {
+                let model = shell_quote(model);
                 format!(" -m {model}")
             }
-            Provider::Anthropic => format!(" --model {model}"),
+            // Only pin a model for `claude` when it actually looks like a Claude
+            // model. Otherwise leave the flag off and let claude use the default
+            // bound to the user's logged-in subscription. This avoids passing
+            // through unrelated provider defaults (e.g. settings.run.model
+            // configured for openai) that claude rejects with empty output.
+            Provider::Anthropic => {
+                if model.starts_with("claude-") {
+                    let model = shell_quote(model);
+                    format!(" --model {model}")
+                } else {
+                    String::new()
+                }
+            }
         }
     };
     // Use `cat | command` instead of `command < file` because the background
@@ -568,10 +582,35 @@ impl CodergenBackend for AgentCliBackend {
             AgentCli::Gemini => CliAgentKind::Gemini,
         };
         let mut launch_env = if let Some(resolver) = &self.resolver {
-            let resolved = resolver
+            let resolve_result = resolver
                 .resolve(provider, CredentialUsage::CliAgent(cli_agent))
-                .await
-                .map_err(|e| Error::handler_with_source("Failed to resolve CLI credential", &e))?;
+                .await;
+            // Anthropic Claude CLI maintains its own login state (~/.claude or
+            // macOS keychain). If fabro has no configured credential, defer to
+            // claude's own auth instead of failing — works for local sandbox
+            // where HOME/keychain are reachable. Headless sandboxes still need
+            // a configured credential; the CLI will fail with its own error.
+            let resolved = match resolve_result {
+                Ok(resolved) => resolved,
+                Err(ResolveError::NotConfigured(Provider::Anthropic))
+                    if matches!(cli_agent, CliAgentKind::Claude) =>
+                {
+                    tracing::info!(
+                        "No fabro-managed Anthropic credential configured; deferring to \
+                         claude CLI's own login state"
+                    );
+                    ResolvedCredential::Cli(fabro_auth::CliCredential {
+                        env_vars:      HashMap::new(),
+                        login_command: None,
+                    })
+                }
+                Err(e) => {
+                    return Err(Error::handler_with_source(
+                        "Failed to resolve CLI credential",
+                        &e,
+                    ));
+                }
+            };
             let ResolvedCredential::Cli(cli_credential) = resolved else {
                 return Err(Error::handler("Expected CLI credential".to_string()));
             };
@@ -1257,6 +1296,20 @@ mod tests {
         let cmd = cli_command_for_provider(Provider::Gemini, "gemini-3.1-pro", "/tmp/prompt.txt");
         assert!(cmd.starts_with("cat /tmp/prompt.txt | gemini -o json --yolo"));
         assert!(cmd.contains("-m gemini-3.1-pro"));
+    }
+
+    #[test]
+    fn cli_command_for_claude_omits_model_when_not_a_claude_model() {
+        // settings.run.model defaulted to e.g. gpt-5.3-codex; we must not pass
+        // it to claude, which would silently exit with empty output.
+        let cmd =
+            cli_command_for_provider(Provider::Anthropic, "gpt-5.3-codex", "/tmp/prompt.txt");
+        assert!(cmd.contains("claude -p"));
+        assert!(!cmd.contains("--model "));
+        // Sanity: a real claude model is still pinned through.
+        let cmd =
+            cli_command_for_provider(Provider::Anthropic, "claude-sonnet-4-5", "/tmp/prompt.txt");
+        assert!(cmd.contains("--model claude-sonnet-4-5"));
     }
 
     #[test]

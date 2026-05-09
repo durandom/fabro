@@ -14,7 +14,7 @@ impl AuthCredential {
     #[must_use]
     pub fn needs_refresh(&self) -> bool {
         match &self.details {
-            AuthDetails::ApiKey { .. } => false,
+            AuthDetails::ApiKey { .. } | AuthDetails::ClaudeCodeOAuth { .. } => false,
             AuthDetails::CodexOAuth { tokens, .. } => {
                 tokens.expires_at <= Utc::now() + Duration::minutes(5)
             }
@@ -33,6 +33,12 @@ pub enum AuthDetails {
         config:     OAuthConfig,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<String>,
+    },
+    /// Claude Code long-lived OAuth token. Consumed by the `claude` CLI tool
+    /// via the `CLAUDE_CODE_OAUTH_TOKEN` env var. Not a valid Anthropic
+    /// API-request credential — only the CliAgent path accepts it.
+    ClaudeCodeOAuth {
+        token: String,
     },
 }
 
@@ -95,6 +101,13 @@ pub fn credential_id_for(credential: &AuthCredential) -> Result<String, String> 
         (Provider::OpenAi, AuthDetails::CodexOAuth { .. }) => Ok("openai_codex".to_string()),
         (_, AuthDetails::CodexOAuth { .. }) => Err(format!(
             "codex_oauth credentials are only valid for OpenAI, got {}",
+            credential.provider
+        )),
+        (Provider::Anthropic, AuthDetails::ClaudeCodeOAuth { .. }) => {
+            Ok("anthropic_claude_oauth".to_string())
+        }
+        (_, AuthDetails::ClaudeCodeOAuth { .. }) => Err(format!(
+            "claude_code_oauth credentials are only valid for Anthropic, got {}",
             credential.provider
         )),
         (provider, AuthDetails::ApiKey { .. }) => Ok(provider.to_string()),
@@ -168,6 +181,31 @@ mod tests {
             },
         };
         assert_eq!(credential_id_for(&credential).unwrap(), "openai");
+    }
+
+    #[test]
+    fn credential_id_for_anthropic_claude_oauth() {
+        let credential = AuthCredential {
+            provider: Provider::Anthropic,
+            details:  AuthDetails::ClaudeCodeOAuth {
+                token: "sk-ant-oat-test".to_string(),
+            },
+        };
+        assert_eq!(
+            credential_id_for(&credential).unwrap(),
+            "anthropic_claude_oauth"
+        );
+    }
+
+    #[test]
+    fn credential_id_for_non_anthropic_claude_oauth_errors() {
+        let credential = AuthCredential {
+            provider: Provider::OpenAi,
+            details:  AuthDetails::ClaudeCodeOAuth {
+                token: "x".to_string(),
+            },
+        };
+        assert!(credential_id_for(&credential).is_err());
     }
 
     #[test]

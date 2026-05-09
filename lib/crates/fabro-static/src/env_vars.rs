@@ -43,6 +43,7 @@ impl EnvVars {
     pub const ANTHROPIC_BASE_URL: &'static str = "ANTHROPIC_BASE_URL";
     pub const BRAVE_SEARCH_API_KEY: &'static str = "BRAVE_SEARCH_API_KEY";
     pub const CHATGPT_ACCOUNT_ID: &'static str = "CHATGPT_ACCOUNT_ID";
+    pub const CLAUDE_CODE_OAUTH_TOKEN: &'static str = "CLAUDE_CODE_OAUTH_TOKEN";
     pub const GEMINI_API_KEY: &'static str = "GEMINI_API_KEY";
     pub const GEMINI_BASE_URL: &'static str = "GEMINI_BASE_URL";
     pub const GOOGLE_API_KEY: &'static str = "GOOGLE_API_KEY";
@@ -181,6 +182,7 @@ mod tests {
             EnvVars::ANTHROPIC_BASE_URL,
             EnvVars::BRAVE_SEARCH_API_KEY,
             EnvVars::CHATGPT_ACCOUNT_ID,
+            EnvVars::CLAUDE_CODE_OAUTH_TOKEN,
             EnvVars::GEMINI_API_KEY,
             EnvVars::GEMINI_BASE_URL,
             EnvVars::GOOGLE_API_KEY,
