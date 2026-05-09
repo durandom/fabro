@@ -296,9 +296,49 @@ async fn build_registry(
         .values()
         .any(|n| graph::is_llm_handler_type(n.handler_type()));
 
+    // CLI-resolved nodes carry their own credentials (e.g. `claude` reads its
+    // OAuth token from the user's keychain or `CLAUDE_CODE_OAUTH_TOKEN` env
+    // var). Fabro doesn't need a vault credential to start a graph whose LLM
+    // nodes are all CLI-resolved.
+    let graph_needs_api_creds = graph.nodes.values().any(|n| {
+        graph::is_llm_handler_type(n.handler_type()) && !node_skips_api_creds_gate(n)
+    });
+
+    let build_full_registry = || {
+        let model = spec.model.clone();
+        let provider = spec.provider;
+        let fallback_chain = spec.fallback_chain.clone();
+        let mcp_servers = spec.mcp_servers.clone();
+        let llm_source_for_api = Arc::clone(&llm_source);
+        let steering_hub_for_api = Arc::clone(&steering_hub);
+        let tool_env_provider_for_backend = Arc::clone(&tool_env_provider);
+        let interviewer_for_registry = Arc::clone(&interviewer);
+        let cli_resolver = cli_resolver.clone();
+        Arc::new(default_registry(interviewer_for_registry, move || {
+            let tool_env_provider = Arc::clone(&tool_env_provider_for_backend);
+            let api = AgentApiBackend::new(
+                model.clone(),
+                provider,
+                fallback_chain.clone(),
+                Arc::clone(&llm_source_for_api),
+                Arc::clone(&steering_hub_for_api),
+            )
+            .with_tool_env_provider(tool_env_provider.clone())
+            .with_mcp_servers(mcp_servers.clone());
+            let cli = cli_resolver
+                .clone()
+                .map_or_else(
+                    || AgentCliBackend::new_from_env(model.clone(), provider),
+                    |resolver| AgentCliBackend::new(model.clone(), provider, resolver),
+                )
+                .with_tool_env_provider(tool_env_provider, github_token_refresh_managed);
+            Some(Box::new(BackendRouter::new(Box::new(api), cli)))
+        }))
+    };
+
     match llm_source.resolve().await {
         Ok(result) if result.credentials.is_empty() => {
-            if graph_needs_llm {
+            if graph_needs_api_creds {
                 let detail = (!result.auth_issues.is_empty()).then(|| {
                     result
                         .auth_issues
@@ -315,47 +355,43 @@ async fn build_registry(
                     "{prefix}. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or pass --dry-run to simulate."
                 )));
             }
-            Ok((build_no_backend(), false))
-        }
-        Ok(_result) => {
-            let model = spec.model.clone();
-            let provider = spec.provider;
-            let fallback_chain = spec.fallback_chain.clone();
-            let mcp_servers = spec.mcp_servers.clone();
-            let llm_source_for_api = Arc::clone(&llm_source);
-            let steering_hub_for_api = Arc::clone(&steering_hub);
-            let tool_env_provider_for_backend = Arc::clone(&tool_env_provider);
-            let registry = Arc::new(default_registry(interviewer, move || {
-                let tool_env_provider = Arc::clone(&tool_env_provider_for_backend);
-                let api = AgentApiBackend::new(
-                    model.clone(),
-                    provider,
-                    fallback_chain.clone(),
-                    Arc::clone(&llm_source_for_api),
-                    Arc::clone(&steering_hub_for_api),
-                )
-                .with_tool_env_provider(tool_env_provider.clone())
-                .with_mcp_servers(mcp_servers.clone());
-                let cli = cli_resolver
-                    .clone()
-                    .map_or_else(
-                        || AgentCliBackend::new_from_env(model.clone(), provider),
-                        |resolver| AgentCliBackend::new(model.clone(), provider, resolver),
-                    )
-                    .with_tool_env_provider(tool_env_provider, github_token_refresh_managed);
-                Some(Box::new(BackendRouter::new(Box::new(api), cli)))
-            }));
-            Ok((registry, false))
-        }
-        Err(e) => {
+            // No API creds, but graph only uses CLI-resolved LLM nodes (or none).
+            // Build the full registry anyway so CLI dispatch works; the API
+            // backend is constructed but never invoked for CLI-only graphs.
             if graph_needs_llm {
+                Ok((build_full_registry(), false))
+            } else {
+                Ok((build_no_backend(), false))
+            }
+        }
+        Ok(_result) => Ok((build_full_registry(), false)),
+        Err(e) => {
+            if graph_needs_api_creds {
                 return Err(Error::Precondition(format!(
                     "Failed to initialize LLM client: {e}. Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or pass --dry-run to simulate.",
                 )));
             }
-            Ok((build_no_backend(), false))
+            if graph_needs_llm {
+                Ok((build_full_registry(), false))
+            } else {
+                Ok((build_no_backend(), false))
+            }
         }
     }
+}
+
+/// Returns true if a node's LLM credentials are managed by the CLI tool itself
+/// (e.g. `claude -p` authenticates via the user's keychain / OAuth token), so
+/// fabro's startup precondition can ignore it. Today this only applies to
+/// Anthropic + `backend="cli"`. Other CLIs (codex, gemini) still need API keys
+/// injected via env vars by the credential resolver.
+fn node_skips_api_creds_gate(node: &graph::Node) -> bool {
+    if node.backend() != Some("cli") {
+        return false;
+    }
+    node.provider()
+        .map(|p| p.eq_ignore_ascii_case("anthropic"))
+        .unwrap_or(false)
 }
 
 fn build_llm_source(vault: Option<Arc<AsyncRwLock<Vault>>>) -> Arc<dyn CredentialSource> {
