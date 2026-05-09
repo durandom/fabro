@@ -78,6 +78,21 @@ pub enum ClaudeSession {
 /// does not exist (yet). Used to flip from `Resume` to `Mint` on first call.
 const CLAUDE_NO_SESSION_MARKER: &str = "No conversation found with session ID";
 
+/// How the next `codex` invocation should attach to a session. Codex does not
+/// accept caller-supplied UUIDs (unlike claude's `--session-id`), so the only
+/// variant is `Resume`: an id that codex itself minted on a prior run and we
+/// captured from its `thread.started` NDJSON event.
+#[derive(Debug, Clone, Copy)]
+pub enum CodexSession {
+    Resume(uuid::Uuid),
+}
+
+/// Stderr fragment codex prints when `codex exec resume <id>` targets a
+/// session whose rollout file no longer exists on disk (or never did, e.g.
+/// after the user wiped `~/.codex/sessions/`). On this we drop the cached id
+/// for the workflow `thread_id` and retry once with a fresh `codex exec`.
+const CODEX_NO_ROLLOUT_MARKER: &str = "no rollout found for thread id";
+
 /// Maps a provider to its corresponding CLI tool metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentCli {
@@ -226,13 +241,15 @@ pub fn is_cli_only_model(model: &str) -> bool {
 ///
 /// The `prompt_file` is the path to a file containing the prompt text, which
 /// is piped into the command's stdin via `cat`. `claude_session` is consulted
-/// only for `Provider::Anthropic`; other providers ignore it.
+/// only for `Provider::Anthropic`; `codex_session` only for codex-driven
+/// providers. Other providers ignore both.
 #[must_use]
 pub fn cli_command_for_provider(
     provider: Provider,
     model: &str,
     prompt_file: &str,
     claude_session: Option<ClaudeSession>,
+    codex_session: Option<CodexSession>,
 ) -> String {
     let prompt_file = shell_quote(prompt_file);
     let model_flag = if model.is_empty() {
@@ -269,14 +286,26 @@ pub fn cli_command_for_provider(
     // redirects in nested shells. A pipe creates an explicit new stdin.
     match provider {
         // --full-auto: sandboxed auto-execution, escalates on request
+        // resume mode: `codex exec resume <UUID>` is a separate subcommand
+        // with a non-overlapping flag set (no `--full-auto`, no `--sandbox`,
+        // no `-s`). We pass `--dangerously-bypass-approvals-and-sandbox` for
+        // unattended execution; that's safe because fabro's outer sandbox
+        // (Docker/Daytona/local-worktree) is what isolates the run.
         Provider::OpenAi
         | Provider::Kimi
         | Provider::Zai
         | Provider::Minimax
         | Provider::Inception
-        | Provider::OpenAiCompatible => {
-            format!("cat {prompt_file} | codex exec --json --full-auto{model_flag}")
-        }
+        | Provider::OpenAiCompatible => match codex_session {
+            Some(CodexSession::Resume(uuid)) => format!(
+                "cat {prompt_file} | codex exec resume --json \
+                 --dangerously-bypass-approvals-and-sandbox \
+                 --skip-git-repo-check {uuid}{model_flag}"
+            ),
+            None => {
+                format!("cat {prompt_file} | codex exec --json --full-auto{model_flag}")
+            }
+        },
         // --yolo: auto-approve all tool calls
         Provider::Gemini => format!("cat {prompt_file} | gemini -o json --yolo{model_flag}"),
         // --dangerously-skip-permissions: bypass all permission checks (required for
@@ -482,6 +511,12 @@ pub struct AgentCliBackend {
     github_token_refresh_managed: bool,
     poll_interval: std::time::Duration,
     resolver: Option<CredentialResolver>,
+    /// In-memory cache of `thread_id` → codex-minted session UUID, populated
+    /// from `parse_codex_ndjson` after each successful run. Subsequent runs
+    /// for the same workflow `thread_id` resume that session via
+    /// `codex exec resume <uuid>`. Lost on fabro restart; first call after
+    /// restart will fall back to a fresh codex session and re-cache.
+    codex_sessions: Arc<Mutex<HashMap<String, uuid::Uuid>>>,
 }
 
 impl AgentCliBackend {
@@ -494,6 +529,7 @@ impl AgentCliBackend {
             github_token_refresh_managed: false,
             poll_interval: std::time::Duration::from_secs(5),
             resolver: Some(resolver),
+            codex_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -506,6 +542,7 @@ impl AgentCliBackend {
             github_token_refresh_managed: false,
             poll_interval: std::time::Duration::from_secs(5),
             resolver: None,
+            codex_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -633,6 +670,25 @@ impl CodergenBackend for AgentCliBackend {
             if provider == Provider::Anthropic && context.fidelity() == Fidelity::Full {
                 thread_id
                     .map(|tid| ClaudeSession::Resume(derive_claude_session_id(tid)))
+            } else {
+                None
+            };
+
+        // For OpenAi + full-fidelity nodes with a `thread_id`, look up a
+        // previously-captured codex session id in the in-process cache. Codex
+        // does not accept caller-minted UUIDs, so cache misses (first run for
+        // this thread_id, or after a fabro restart) fall through to a fresh
+        // `codex exec`; the captured id from the resulting NDJSON is then
+        // stored in the cache for subsequent calls in the same fabro process.
+        let mut codex_session: Option<CodexSession> =
+            if provider == Provider::OpenAi && context.fidelity() == Fidelity::Full {
+                thread_id.and_then(|tid| {
+                    let cache = self
+                        .codex_sessions
+                        .lock()
+                        .expect("codex session cache mutex poisoned");
+                    cache.get(tid).copied().map(CodexSession::Resume)
+                })
             } else {
                 None
             };
@@ -770,7 +826,13 @@ impl CodergenBackend for AgentCliBackend {
         // switching to `Mint`. All other providers and non-resumable Anthropic
         // calls execute exactly one iteration.
         let stdout = loop {
-            let command = cli_command_for_provider(provider, model, &prompt_path, claude_session);
+            let command = cli_command_for_provider(
+                provider,
+                model,
+                &prompt_path,
+                claude_session,
+                codex_session,
+            );
             emitter.emit_scoped(
                 &Event::AgentCliStarted {
                     node_id:  node.id.clone(),
@@ -925,6 +987,29 @@ impl CodergenBackend for AgentCliBackend {
                 }
             }
 
+            // Codex equivalent: if we tried to resume a cached session id but
+            // codex says the rollout is gone (sessions cleared, ephemeral
+            // rollout, etc.), drop the cache entry and retry with a fresh
+            // `codex exec` — the next run captures a new id.
+            if let Some(CodexSession::Resume(uuid)) = codex_session {
+                if stderr.contains(CODEX_NO_ROLLOUT_MARKER) {
+                    tracing::info!(
+                        node = %node.id,
+                        thread_id = ?thread_id,
+                        %uuid,
+                        "Codex rollout missing; falling back to fresh session"
+                    );
+                    if let Some(tid) = thread_id {
+                        self.codex_sessions
+                            .lock()
+                            .expect("codex session cache mutex poisoned")
+                            .remove(tid);
+                    }
+                    codex_session = None;
+                    continue;
+                }
+            }
+
             cleanup_temp_files().await;
             let detail = cli_failure_detail(&stdout, &stderr, &command);
             return Err(Error::handler(format!(
@@ -941,6 +1026,19 @@ impl CodergenBackend for AgentCliBackend {
         // 4. Parse the CLI output
         let parsed = parse_cli_response(provider, &stdout)
             .ok_or_else(|| Error::handler("Failed to parse CLI output".to_string()))?;
+
+        // Cache codex's minted session id under the workflow `thread_id` so
+        // the next call in the same fabro process resumes this conversation.
+        // Only OpenAi is in scope today (matches the resume gate above);
+        // other codex-driven providers fall through unchanged.
+        if provider == Provider::OpenAi && context.fidelity() == Fidelity::Full {
+            if let (Some(captured), Some(tid)) = (parsed.captured_session_id, thread_id) {
+                self.codex_sessions
+                    .lock()
+                    .expect("codex session cache mutex poisoned")
+                    .insert(tid.to_string(), captured);
+            }
+        }
 
         // 5. Detect changed files
         let files_after = self.detect_changed_files(sandbox).await;
@@ -1378,10 +1476,46 @@ mod tests {
 
     #[test]
     fn cli_command_for_codex() {
-        let cmd =
-            cli_command_for_provider(Provider::OpenAi, "gpt-5.3-codex", "/tmp/prompt.txt", None);
+        let cmd = cli_command_for_provider(
+            Provider::OpenAi,
+            "gpt-5.3-codex",
+            "/tmp/prompt.txt",
+            None,
+            None,
+        );
         assert!(cmd.starts_with("cat /tmp/prompt.txt | codex exec --json --full-auto"));
         assert!(cmd.contains("-m gpt-5.3-codex"));
+    }
+
+    #[test]
+    fn cli_command_for_codex_resume() {
+        let uuid = uuid::uuid!("019e0d50-1505-7da3-bcd9-43780c698fc9");
+        let cmd = cli_command_for_provider(
+            Provider::OpenAi,
+            "gpt-5.3-codex",
+            "/tmp/prompt.txt",
+            None,
+            Some(CodexSession::Resume(uuid)),
+        );
+        assert!(cmd.contains("codex exec resume"));
+        assert!(cmd.contains(&uuid.to_string()));
+        assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
+        // resume subcommand rejects --full-auto
+        assert!(!cmd.contains("--full-auto"));
+    }
+
+    #[test]
+    fn codex_session_ignored_for_non_codex_providers() {
+        let uuid = uuid::uuid!("019e0d50-1505-7da3-bcd9-43780c698fc9");
+        let cmd = cli_command_for_provider(
+            Provider::Anthropic,
+            "claude-opus-4-6",
+            "/tmp/p.txt",
+            None,
+            Some(CodexSession::Resume(uuid)),
+        );
+        assert!(!cmd.contains("codex exec resume"));
+        assert!(!cmd.contains(&uuid.to_string()));
     }
 
     #[test]
@@ -1390,6 +1524,7 @@ mod tests {
             Provider::Anthropic,
             "claude-opus-4-6",
             "/tmp/prompt.txt",
+            None,
             None,
         );
         assert!(cmd.starts_with("cat /tmp/prompt.txt |"));
@@ -1409,6 +1544,7 @@ mod tests {
             "claude-opus-4-6",
             "/tmp/prompt.txt",
             Some(ClaudeSession::Resume(uuid)),
+            None,
         );
         assert!(cmd.contains(&format!("--resume {uuid}")));
         assert!(!cmd.contains("--session-id"));
@@ -1422,6 +1558,7 @@ mod tests {
             "claude-opus-4-6",
             "/tmp/prompt.txt",
             Some(ClaudeSession::Mint(uuid)),
+            None,
         );
         assert!(cmd.contains(&format!("--session-id {uuid}")));
         assert!(!cmd.contains("--resume"));
@@ -1433,6 +1570,7 @@ mod tests {
             Provider::Gemini,
             "gemini-3.1-pro",
             "/tmp/prompt.txt",
+            None,
             None,
         );
         assert!(cmd.starts_with("cat /tmp/prompt.txt | gemini -o json --yolo"));
@@ -1448,6 +1586,7 @@ mod tests {
             "gpt-5.3-codex",
             "/tmp/prompt.txt",
             None,
+            None,
         );
         assert!(cmd.contains("claude -p"));
         assert!(!cmd.contains("--model "));
@@ -1457,19 +1596,20 @@ mod tests {
             "claude-sonnet-4-5",
             "/tmp/prompt.txt",
             None,
+            None,
         );
         assert!(cmd.contains("--model claude-sonnet-4-5"));
     }
 
     #[test]
     fn cli_command_omits_model_when_empty() {
-        let cmd = cli_command_for_provider(Provider::OpenAi, "", "/tmp/prompt.txt", None);
+        let cmd = cli_command_for_provider(Provider::OpenAi, "", "/tmp/prompt.txt", None, None);
         assert!(cmd.contains("codex exec --json --full-auto"));
         assert!(!cmd.contains("-m "));
-        let cmd = cli_command_for_provider(Provider::Anthropic, "", "/tmp/prompt.txt", None);
+        let cmd = cli_command_for_provider(Provider::Anthropic, "", "/tmp/prompt.txt", None, None);
         assert!(cmd.contains("--dangerously-skip-permissions"));
         assert!(!cmd.contains("--model "));
-        let cmd = cli_command_for_provider(Provider::Gemini, "", "/tmp/prompt.txt", None);
+        let cmd = cli_command_for_provider(Provider::Gemini, "", "/tmp/prompt.txt", None, None);
         assert!(cmd.contains("--yolo"));
         assert!(!cmd.contains("-m "));
     }
@@ -1492,6 +1632,7 @@ mod tests {
             "gpt-5",
             "/tmp/p.txt",
             Some(ClaudeSession::Resume(uuid)),
+            None,
         );
         assert!(!cmd.contains("--resume"));
         assert!(!cmd.contains("--session-id"));
