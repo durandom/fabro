@@ -705,11 +705,16 @@ impl CodergenBackend for AgentCliBackend {
             let resolve_result = resolver
                 .resolve(provider, CredentialUsage::CliAgent(cli_agent))
                 .await;
-            // Anthropic Claude CLI maintains its own login state (~/.claude or
-            // macOS keychain). If fabro has no configured credential, defer to
-            // claude's own auth instead of failing — works for local sandbox
-            // where HOME/keychain are reachable. Headless sandboxes still need
-            // a configured credential; the CLI will fail with its own error.
+            // Anthropic Claude CLI and OpenAI Codex CLI maintain their own
+            // login state (~/.claude or keychain for claude; ~/.codex/auth.json
+            // for codex). If fabro has no configured credential, defer to the
+            // CLI's own auth instead of failing — works for local sandbox
+            // where HOME is reachable. Headless sandboxes still need a
+            // configured credential; the CLI will fail with its own error.
+            //
+            // For codex this also avoids the side-effect of running
+            // `codex login --with-api-key`, which would otherwise overwrite
+            // the user's chatgpt-mode auth.json.
             let resolved = match resolve_result {
                 Ok(resolved) => resolved,
                 Err(ResolveError::NotConfigured(Provider::Anthropic))
@@ -718,6 +723,18 @@ impl CodergenBackend for AgentCliBackend {
                     tracing::info!(
                         "No fabro-managed Anthropic credential configured; deferring to \
                          claude CLI's own login state"
+                    );
+                    ResolvedCredential::Cli(fabro_auth::CliCredential {
+                        env_vars:      HashMap::new(),
+                        login_command: None,
+                    })
+                }
+                Err(ResolveError::NotConfigured(Provider::OpenAi))
+                    if matches!(cli_agent, CliAgentKind::Codex) =>
+                {
+                    tracing::info!(
+                        "No fabro-managed OpenAI credential configured; deferring to codex \
+                         CLI's own login state (~/.codex/auth.json)"
                     );
                     ResolvedCredential::Cli(fabro_auth::CliCredential {
                         env_vars:      HashMap::new(),

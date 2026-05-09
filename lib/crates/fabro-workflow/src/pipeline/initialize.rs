@@ -382,15 +382,17 @@ async fn build_registry(
 
 /// Returns true if a node's LLM credentials are managed by the CLI tool itself
 /// (e.g. `claude -p` authenticates via the user's keychain / OAuth token), so
-/// fabro's startup precondition can ignore it. Today this only applies to
-/// Anthropic + `backend="cli"`. Other CLIs (codex, gemini) still need API keys
-/// injected via env vars by the credential resolver.
+/// fabro's startup precondition can ignore it. Applies to:
+/// - Anthropic + `backend="cli"` — claude reads keychain/OAuth or `CLAUDE_CODE_OAUTH_TOKEN`
+/// - OpenAI + `backend="cli"` — codex reads `~/.codex/auth.json`
+///
+/// Gemini CLI still needs a fabro-injected API key.
 fn node_skips_api_creds_gate(node: &graph::Node) -> bool {
     if node.backend() != Some("cli") {
         return false;
     }
     node.provider()
-        .map(|p| p.eq_ignore_ascii_case("anthropic"))
+        .map(|p| p.eq_ignore_ascii_case("anthropic") || p.eq_ignore_ascii_case("openai"))
         .unwrap_or(false)
 }
 
