@@ -39,10 +39,42 @@ fn cli_failure_detail(stdout: &str, stderr: &str, command: &str) -> String {
 }
 
 use super::super::agent::{CodergenBackend, CodergenResult};
-use crate::context::Context;
+use crate::context::keys::Fidelity;
+use crate::context::{Context, WorkflowContext};
 use crate::error::Error;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::outcome::billed_model_usage_from_llm;
+
+/// Fabro-specific UUID v5 namespace for deriving deterministic Claude session
+/// IDs from a workflow `thread_id`. Generated once for the fork; never change
+/// without coordinating with any persisted Claude session storage that fabro
+/// has previously written.
+const FABRO_CLAUDE_SESSION_NS: uuid::Uuid =
+    uuid::uuid!("8d4b1f1a-5c2e-4f3b-9a7d-2c5e6f8a1b3c");
+
+/// Derive a deterministic Claude session UUID from a fabro `thread_id`.
+///
+/// Same `thread_id` always maps to the same UUID, so a workflow stage can
+/// resume Claude's prior conversation across fabro process restarts without
+/// any in-memory cache. The fabro-specific namespace prevents collisions
+/// with other tools that may share the user's Claude session store.
+#[must_use]
+pub fn derive_claude_session_id(thread_id: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&FABRO_CLAUDE_SESSION_NS, thread_id.as_bytes())
+}
+
+/// How the next `claude` invocation should attach to a session.
+#[derive(Debug, Clone, Copy)]
+pub enum ClaudeSession {
+    /// Pass `--resume <uuid>` to load a prior conversation.
+    Resume(uuid::Uuid),
+    /// Pass `--session-id <uuid>` to mint a new conversation under our id.
+    Mint(uuid::Uuid),
+}
+
+/// Stderr fragment claude prints when `--resume <id>` targets a session that
+/// does not exist (yet). Used to flip from `Resume` to `Mint` on first call.
+const CLAUDE_NO_SESSION_MARKER: &str = "No conversation found with session ID";
 
 /// Maps a provider to its corresponding CLI tool metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,9 +223,15 @@ pub fn is_cli_only_model(model: &str) -> bool {
 /// Build the CLI command string for a given provider.
 ///
 /// The `prompt_file` is the path to a file containing the prompt text, which
-/// is piped into the command's stdin via `cat`.
+/// is piped into the command's stdin via `cat`. `claude_session` is consulted
+/// only for `Provider::Anthropic`; other providers ignore it.
 #[must_use]
-pub fn cli_command_for_provider(provider: Provider, model: &str, prompt_file: &str) -> String {
+pub fn cli_command_for_provider(
+    provider: Provider,
+    model: &str,
+    prompt_file: &str,
+    claude_session: Option<ClaudeSession>,
+) -> String {
     let prompt_file = shell_quote(prompt_file);
     let model_flag = if model.is_empty() {
         String::new()
@@ -230,9 +268,16 @@ pub fn cli_command_for_provider(provider: Provider, model: &str, prompt_file: &s
         // --dangerously-skip-permissions: bypass all permission checks (required for
         // non-interactive use). CLAUDECODE= unset to allow running inside a Claude Code
         // session.
-        Provider::Anthropic => format!(
-            "cat {prompt_file} | CLAUDECODE= claude -p --verbose --output-format stream-json --dangerously-skip-permissions{model_flag}"
-        ),
+        Provider::Anthropic => {
+            let session_flag = match claude_session {
+                Some(ClaudeSession::Resume(uuid)) => format!(" --resume {uuid}"),
+                Some(ClaudeSession::Mint(uuid)) => format!(" --session-id {uuid}"),
+                None => String::new(),
+            };
+            format!(
+                "cat {prompt_file} | CLAUDECODE= claude -p --verbose --output-format stream-json --dangerously-skip-permissions{session_flag}{model_flag}"
+            )
+        }
     }
 }
 
@@ -514,7 +559,7 @@ impl CodergenBackend for AgentCliBackend {
         node: &Node,
         prompt: &str,
         context: &Context,
-        _thread_id: Option<&str>,
+        thread_id: Option<&str>,
         emitter: &Arc<Emitter>,
         sandbox: &Arc<dyn Sandbox>,
         _tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
@@ -545,19 +590,21 @@ impl CodergenBackend for AgentCliBackend {
         let cli = AgentCli::for_provider(provider);
         ensure_cli(cli, provider, sandbox, emitter, &cancel_token).await?;
 
-        let command = cli_command_for_provider(provider, model, &prompt_path);
         let stage_scope = StageScope::for_handler(context, &node.id);
-        emitter.emit_scoped(
-            &Event::AgentCliStarted {
-                node_id:  node.id.clone(),
-                visit:    stage_scope.visit,
-                mode:     "cli".to_string(),
-                provider: provider.to_string(),
-                model:    model.to_string(),
-                command:  command.clone(),
-            },
-            &stage_scope,
-        );
+
+        // For Anthropic + full-fidelity nodes carrying a `thread_id`, derive a
+        // deterministic Claude session UUID from the thread id and resume the
+        // prior conversation. The first call for a given thread_id will fail
+        // resume with "No conversation found"; we detect that, mint the
+        // session under our id, and proceed. After that, the on-disk session
+        // exists and resume succeeds in a single call.
+        let mut claude_session: Option<ClaudeSession> =
+            if provider == Provider::Anthropic && context.fidelity() == Fidelity::Full {
+                thread_id
+                    .map(|tid| ClaudeSession::Resume(derive_claude_session_id(tid)))
+            } else {
+                None
+            };
 
         // Forward provider API key and custom env vars so the CLI tool can
         // authenticate. Resolve credentials and run any pre-login command
@@ -644,51 +691,12 @@ impl CodergenBackend for AgentCliBackend {
         // launcher could not be cancelled mid-flight. By running through
         // `exec_command_streaming` the run-level cancel token (and node
         // timeout, when set) terminate the CLI and its descendants.
-        let outer_command = format!(". {} && {command}", shell_quote(&env_path));
-        // Use a synchronous Mutex: each callback invocation only does a short
-        // `extend_from_slice` with no awaits while the lock is held, so an
-        // async Mutex would just add per-chunk scheduling overhead.
-        let stdout_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let stderr_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let stdout_buf_cb = Arc::clone(&stdout_buffer);
-        let stderr_buf_cb = Arc::clone(&stderr_buffer);
-        let emitter_for_callback = Arc::clone(emitter);
-        let output_callback: fabro_agent::CommandOutputCallback = Arc::new(move |stream, bytes| {
-            let stdout_buf = Arc::clone(&stdout_buf_cb);
-            let stderr_buf = Arc::clone(&stderr_buf_cb);
-            let emitter = Arc::clone(&emitter_for_callback);
-            Box::pin(async move {
-                // Touch the stall watchdog whenever the CLI emits output
-                // so long-running invocations don't trip stall timeout.
-                emitter.touch();
-                let buf = match stream {
-                    CommandOutputStream::Stdout => stdout_buf,
-                    CommandOutputStream::Stderr => stderr_buf,
-                };
-                buf.lock()
-                    .expect("CLI output buffer mutex poisoned")
-                    .extend_from_slice(&bytes);
-                Ok(())
-            })
-        });
         let launch_env_ref = if launch_env.is_empty() {
             None
         } else {
             Some(&launch_env)
         };
         let timeout_ms = node.timeout().map(crate::millis_u64);
-        let invocation_token = cancel_token.child_token();
-        let launch_start = std::time::Instant::now();
-        let streaming_result = sandbox
-            .exec_command_streaming(
-                &outer_command,
-                timeout_ms,
-                None,
-                launch_env_ref,
-                Some(invocation_token.clone()),
-                output_callback,
-            )
-            .await;
 
         let cleanup_temp_files = || {
             let sandbox = Arc::clone(sandbox);
@@ -700,93 +708,168 @@ impl CodergenBackend for AgentCliBackend {
             }
         };
 
-        let streaming = match streaming_result {
-            Ok(streaming) => streaming,
-            Err(err) => {
-                cleanup_temp_files().await;
-                return Err(Error::handler_with_source(
-                    "Failed to run CLI command",
-                    &err,
-                ));
-            }
-        };
-        let result = streaming.result;
-        // Prefer the buffered streaming output (live chunks); fall back to the
-        // result struct for sandboxes that bundle output at the end.
-        let buffered_stdout = {
-            let buf = stdout_buffer
-                .lock()
-                .expect("CLI stdout buffer mutex poisoned");
-            String::from_utf8_lossy(&buf).into_owned()
-        };
-        let buffered_stderr = {
-            let buf = stderr_buffer
-                .lock()
-                .expect("CLI stderr buffer mutex poisoned");
-            String::from_utf8_lossy(&buf).into_owned()
-        };
-        let stdout = if buffered_stdout.is_empty() {
-            result.stdout.clone()
-        } else {
-            buffered_stdout
-        };
-        let stderr = if buffered_stderr.is_empty() {
-            result.stderr.clone()
-        } else {
-            buffered_stderr
-        };
-        let duration_ms = elapsed_ms(launch_start);
+        // Outer loop runs the CLI at most twice: once with the chosen Claude
+        // session mode, and (only if the first call returned the "no
+        // conversation found" marker while in `Resume` mode) once more after
+        // switching to `Mint`. All other providers and non-resumable Anthropic
+        // calls execute exactly one iteration.
+        let stdout = loop {
+            let command = cli_command_for_provider(provider, model, &prompt_path, claude_session);
+            emitter.emit_scoped(
+                &Event::AgentCliStarted {
+                    node_id:  node.id.clone(),
+                    visit:    stage_scope.visit,
+                    mode:     "cli".to_string(),
+                    provider: provider.to_string(),
+                    model:    model.to_string(),
+                    command:  command.clone(),
+                },
+                &stage_scope,
+            );
 
-        match result.termination {
-            CommandTermination::Cancelled => {
-                emitter.emit_scoped(
-                    &Event::AgentCliCancelled {
-                        node_id: node.id.clone(),
-                        stdout: stdout.clone(),
-                        stderr: stderr.clone(),
-                        duration_ms,
-                    },
-                    &stage_scope,
-                );
-                cleanup_temp_files().await;
-                return Err(Error::Cancelled);
-            }
-            CommandTermination::TimedOut => {
-                emitter.emit_scoped(
-                    &Event::AgentCliTimedOut {
-                        node_id: node.id.clone(),
-                        stdout: stdout.clone(),
-                        stderr: stderr.clone(),
-                        duration_ms,
-                    },
-                    &stage_scope,
-                );
-                cleanup_temp_files().await;
-                let detail = cli_failure_detail(&stdout, &stderr, &command);
-                return Err(Error::handler(format!(
-                    "CLI command timed out after {duration_ms} ms: {detail}"
-                )));
-            }
-            CommandTermination::Exited => {
-                emitter.emit_scoped(
-                    &Event::AgentCliCompleted {
-                        node_id: node.id.clone(),
-                        stdout: stdout.clone(),
-                        stderr: stderr.clone(),
-                        exit_code: result.exit_code.unwrap_or(-1),
-                        duration_ms,
-                    },
-                    &stage_scope,
-                );
-            }
-        }
+            let outer_command = format!(". {} && {command}", shell_quote(&env_path));
+            // Use a synchronous Mutex: each callback invocation only does a short
+            // `extend_from_slice` with no awaits while the lock is held, so an
+            // async Mutex would just add per-chunk scheduling overhead.
+            let stdout_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let stderr_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let stdout_buf_cb = Arc::clone(&stdout_buffer);
+            let stderr_buf_cb = Arc::clone(&stderr_buffer);
+            let emitter_for_callback = Arc::clone(emitter);
+            let output_callback: fabro_agent::CommandOutputCallback =
+                Arc::new(move |stream, bytes| {
+                    let stdout_buf = Arc::clone(&stdout_buf_cb);
+                    let stderr_buf = Arc::clone(&stderr_buf_cb);
+                    let emitter = Arc::clone(&emitter_for_callback);
+                    Box::pin(async move {
+                        // Touch the stall watchdog whenever the CLI emits output
+                        // so long-running invocations don't trip stall timeout.
+                        emitter.touch();
+                        let buf = match stream {
+                            CommandOutputStream::Stdout => stdout_buf,
+                            CommandOutputStream::Stderr => stderr_buf,
+                        };
+                        buf.lock()
+                            .expect("CLI output buffer mutex poisoned")
+                            .extend_from_slice(&bytes);
+                        Ok(())
+                    })
+                });
+            let invocation_token = cancel_token.child_token();
+            let launch_start = std::time::Instant::now();
+            let streaming_result = sandbox
+                .exec_command_streaming(
+                    &outer_command,
+                    timeout_ms,
+                    None,
+                    launch_env_ref,
+                    Some(invocation_token.clone()),
+                    output_callback,
+                )
+                .await;
 
-        // Cleanup temp files (Exited path).
-        cleanup_temp_files().await;
+            let streaming = match streaming_result {
+                Ok(streaming) => streaming,
+                Err(err) => {
+                    cleanup_temp_files().await;
+                    return Err(Error::handler_with_source(
+                        "Failed to run CLI command",
+                        &err,
+                    ));
+                }
+            };
+            let result = streaming.result;
+            // Prefer the buffered streaming output (live chunks); fall back to
+            // the result struct for sandboxes that bundle output at the end.
+            let buffered_stdout = {
+                let buf = stdout_buffer
+                    .lock()
+                    .expect("CLI stdout buffer mutex poisoned");
+                String::from_utf8_lossy(&buf).into_owned()
+            };
+            let buffered_stderr = {
+                let buf = stderr_buffer
+                    .lock()
+                    .expect("CLI stderr buffer mutex poisoned");
+                String::from_utf8_lossy(&buf).into_owned()
+            };
+            let stdout = if buffered_stdout.is_empty() {
+                result.stdout.clone()
+            } else {
+                buffered_stdout
+            };
+            let stderr = if buffered_stderr.is_empty() {
+                result.stderr.clone()
+            } else {
+                buffered_stderr
+            };
+            let duration_ms = elapsed_ms(launch_start);
 
-        let exited_success =
-            result.termination == CommandTermination::Exited && result.exit_code == Some(0);
-        if !exited_success {
+            match result.termination {
+                CommandTermination::Cancelled => {
+                    emitter.emit_scoped(
+                        &Event::AgentCliCancelled {
+                            node_id: node.id.clone(),
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
+                            duration_ms,
+                        },
+                        &stage_scope,
+                    );
+                    cleanup_temp_files().await;
+                    return Err(Error::Cancelled);
+                }
+                CommandTermination::TimedOut => {
+                    emitter.emit_scoped(
+                        &Event::AgentCliTimedOut {
+                            node_id: node.id.clone(),
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
+                            duration_ms,
+                        },
+                        &stage_scope,
+                    );
+                    cleanup_temp_files().await;
+                    let detail = cli_failure_detail(&stdout, &stderr, &command);
+                    return Err(Error::handler(format!(
+                        "CLI command timed out after {duration_ms} ms: {detail}"
+                    )));
+                }
+                CommandTermination::Exited => {
+                    emitter.emit_scoped(
+                        &Event::AgentCliCompleted {
+                            node_id: node.id.clone(),
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
+                            exit_code: result.exit_code.unwrap_or(-1),
+                            duration_ms,
+                        },
+                        &stage_scope,
+                    );
+                }
+            }
+
+            let exited_success = result.exit_code == Some(0);
+            if exited_success {
+                break stdout;
+            }
+
+            // Failed exit. If we were trying to resume a Claude session that
+            // hasn't been minted yet, switch to mint mode and retry once.
+            if let Some(ClaudeSession::Resume(uuid)) = claude_session {
+                if stderr.contains(CLAUDE_NO_SESSION_MARKER) {
+                    tracing::info!(
+                        node = %node.id,
+                        thread_id = ?thread_id,
+                        %uuid,
+                        "Claude session not found; minting under fabro-derived id"
+                    );
+                    claude_session = Some(ClaudeSession::Mint(uuid));
+                    continue;
+                }
+            }
+
+            cleanup_temp_files().await;
             let detail = cli_failure_detail(&stdout, &stderr, &command);
             return Err(Error::handler(format!(
                 "CLI command exited with code {}: {detail}",
@@ -794,7 +877,10 @@ impl CodergenBackend for AgentCliBackend {
                     .exit_code
                     .map_or_else(|| "<unknown>".to_string(), |c| c.to_string()),
             )));
-        }
+        };
+
+        // Cleanup temp files (Exited path).
+        cleanup_temp_files().await;
 
         // 4. Parse the CLI output
         let parsed = parse_cli_response(provider, &stdout)
@@ -1236,40 +1322,101 @@ mod tests {
 
     #[test]
     fn cli_command_for_codex() {
-        let cmd = cli_command_for_provider(Provider::OpenAi, "gpt-5.3-codex", "/tmp/prompt.txt");
+        let cmd =
+            cli_command_for_provider(Provider::OpenAi, "gpt-5.3-codex", "/tmp/prompt.txt", None);
         assert!(cmd.starts_with("cat /tmp/prompt.txt | codex exec --json --full-auto"));
         assert!(cmd.contains("-m gpt-5.3-codex"));
     }
 
     #[test]
     fn cli_command_for_claude() {
-        let cmd =
-            cli_command_for_provider(Provider::Anthropic, "claude-opus-4-6", "/tmp/prompt.txt");
+        let cmd = cli_command_for_provider(
+            Provider::Anthropic,
+            "claude-opus-4-6",
+            "/tmp/prompt.txt",
+            None,
+        );
         assert!(cmd.starts_with("cat /tmp/prompt.txt |"));
         assert!(cmd.contains("claude -p"));
         assert!(cmd.contains("--dangerously-skip-permissions"));
         assert!(cmd.contains("--output-format stream-json"));
         assert!(cmd.contains("--model claude-opus-4-6"));
+        assert!(!cmd.contains("--resume"));
+        assert!(!cmd.contains("--session-id"));
+    }
+
+    #[test]
+    fn cli_command_for_claude_resume_flag() {
+        let uuid = derive_claude_session_id("thread-A");
+        let cmd = cli_command_for_provider(
+            Provider::Anthropic,
+            "claude-opus-4-6",
+            "/tmp/prompt.txt",
+            Some(ClaudeSession::Resume(uuid)),
+        );
+        assert!(cmd.contains(&format!("--resume {uuid}")));
+        assert!(!cmd.contains("--session-id"));
+    }
+
+    #[test]
+    fn cli_command_for_claude_mint_flag() {
+        let uuid = derive_claude_session_id("thread-A");
+        let cmd = cli_command_for_provider(
+            Provider::Anthropic,
+            "claude-opus-4-6",
+            "/tmp/prompt.txt",
+            Some(ClaudeSession::Mint(uuid)),
+        );
+        assert!(cmd.contains(&format!("--session-id {uuid}")));
+        assert!(!cmd.contains("--resume"));
     }
 
     #[test]
     fn cli_command_for_gemini() {
-        let cmd = cli_command_for_provider(Provider::Gemini, "gemini-3.1-pro", "/tmp/prompt.txt");
+        let cmd = cli_command_for_provider(
+            Provider::Gemini,
+            "gemini-3.1-pro",
+            "/tmp/prompt.txt",
+            None,
+        );
         assert!(cmd.starts_with("cat /tmp/prompt.txt | gemini -o json --yolo"));
         assert!(cmd.contains("-m gemini-3.1-pro"));
     }
 
     #[test]
     fn cli_command_omits_model_when_empty() {
-        let cmd = cli_command_for_provider(Provider::OpenAi, "", "/tmp/prompt.txt");
+        let cmd = cli_command_for_provider(Provider::OpenAi, "", "/tmp/prompt.txt", None);
         assert!(cmd.contains("codex exec --json --full-auto"));
         assert!(!cmd.contains("-m "));
-        let cmd = cli_command_for_provider(Provider::Anthropic, "", "/tmp/prompt.txt");
+        let cmd = cli_command_for_provider(Provider::Anthropic, "", "/tmp/prompt.txt", None);
         assert!(cmd.contains("--dangerously-skip-permissions"));
         assert!(!cmd.contains("--model "));
-        let cmd = cli_command_for_provider(Provider::Gemini, "", "/tmp/prompt.txt");
+        let cmd = cli_command_for_provider(Provider::Gemini, "", "/tmp/prompt.txt", None);
         assert!(cmd.contains("--yolo"));
         assert!(!cmd.contains("-m "));
+    }
+
+    #[test]
+    fn derive_claude_session_id_is_deterministic() {
+        let a1 = derive_claude_session_id("thread-X");
+        let a2 = derive_claude_session_id("thread-X");
+        let b = derive_claude_session_id("thread-Y");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_eq!(a1.get_version_num(), 5);
+    }
+
+    #[test]
+    fn claude_session_ignored_for_non_anthropic_providers() {
+        let uuid = derive_claude_session_id("t");
+        let cmd = cli_command_for_provider(
+            Provider::OpenAi,
+            "gpt-5",
+            "/tmp/p.txt",
+            Some(ClaudeSession::Resume(uuid)),
+        );
+        assert!(!cmd.contains("--resume"));
+        assert!(!cmd.contains("--session-id"));
     }
 
     // -- Cycle 2: is_cli_only_model --
