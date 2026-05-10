@@ -312,21 +312,14 @@ impl CredentialResolver {
                 env_vars.insert(EnvVars::OPENAI_API_KEY.to_string(), key.clone());
                 Some(codex_login_command(key))
             }
-            (
-                Provider::OpenAi,
-                AuthDetails::CodexOAuth {
-                    tokens, account_id, ..
-                },
-                CliAgentKind::Codex,
-            ) => {
-                env_vars.insert(
-                    EnvVars::OPENAI_API_KEY.to_string(),
-                    tokens.access_token.clone(),
-                );
-                if let Some(account_id) = account_id {
-                    env_vars.insert(EnvVars::CHATGPT_ACCOUNT_ID.to_string(), account_id.clone());
-                }
-                Some(codex_login_command(&tokens.access_token))
+            (Provider::OpenAi, AuthDetails::CodexOAuth { .. }, CliAgentKind::Codex) => {
+                // CodexOAuth tokens are ChatGPT-app JWTs scoped to
+                // chatgpt.com/backend-api/codex; they are NOT OpenAI Platform
+                // API keys and lack `api.responses.write`. Injecting them as
+                // OPENAI_API_KEY plus running `codex login --with-api-key`
+                // would clobber the user's chatgpt-mode ~/.codex/auth.json
+                // and cause 401s. Defer to codex's own on-disk auth instead.
+                None
             }
             (
                 Provider::Anthropic,
@@ -725,7 +718,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_codex_cli_credential_includes_login_command_and_account_id() {
+    async fn openai_codex_cli_credential_defers_to_on_disk_auth() {
+        // CodexOAuth tokens are NOT OpenAI Platform API keys. The CLI
+        // resolver must produce empty creds and rely on codex's own
+        // ~/.codex/auth.json — anything else risks clobbering the user's
+        // chatgpt-mode login and producing 401s on api.openai.com.
         let dir = tempfile::tempdir().unwrap();
         let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
         vault_set_credential(
@@ -750,18 +747,15 @@ mod tests {
             panic!("expected cli credential");
         };
 
-        assert_eq!(
-            cli.env_vars.get("OPENAI_API_KEY").map(String::as_str),
-            Some("expired-access")
-        );
-        assert_eq!(
-            cli.env_vars.get("CHATGPT_ACCOUNT_ID").map(String::as_str),
-            Some("acct_123")
+        assert!(
+            cli.env_vars.is_empty(),
+            "CodexOAuth must not inject env vars into codex CLI subprocess; got {:?}",
+            cli.env_vars
         );
         assert!(
+            cli.login_command.is_none(),
+            "CodexOAuth must not run `codex login --with-api-key`; got {:?}",
             cli.login_command
-                .as_deref()
-                .is_some_and(|command| command.contains("codex login --with-api-key"))
         );
     }
 
@@ -979,10 +973,11 @@ mod tests {
             panic!("expected cli credential");
         };
 
-        assert_eq!(
-            cli.env_vars.get("OPENAI_API_KEY").map(String::as_str),
-            Some("new-access")
-        );
+        // CodexOAuth + Codex CLI defers to ~/.codex/auth.json, so resolved
+        // creds must be empty even after a successful refresh. The refresh
+        // itself is verified via the persisted vault state below.
+        assert!(cli.env_vars.is_empty());
+        assert!(cli.login_command.is_none());
 
         let stored = {
             let vault = vault.read().await;
